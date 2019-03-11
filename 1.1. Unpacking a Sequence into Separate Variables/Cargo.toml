@@ -1,0 +1,11 @@
+[package]
+name = "unpacking"
+version = "0.1.0"
+authors = ["yushi <yushihuang@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+
+[[bin]]
+name = "unpacking"
+path = "main.rs"
