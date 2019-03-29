@@ -33,7 +33,7 @@ impl<'a> Iterator for Lexer<'a> {
     type Item = Token;
     
     fn next (&mut self) -> Option<Self::Item> {
-        static tokens : [(&str, &(Fn(&str)->Result<Token, &str> + Sync)); 8] = [
+        static TOKENS : [(&str, &(Fn(&str)->Result<Token, &str> + Sync)); 8] = [
             (r#"\d+"#, &|t|t.parse::<i64>().map(|i|Token::Num(i)).map_err(|_|"parse i64")),
             (r#"\+"#,  &|_|Ok(Token::Add)),
             (r#"-"#,   &|_|Ok(Token::Sub)),
@@ -44,11 +44,11 @@ impl<'a> Iterator for Lexer<'a> {
             (r#"\s+"#, &|_|Ok(Token::Ws)),
         ];
         lazy_static! {
-            static ref r : regex::Regex = regex::Regex::new(&tokens.iter().map(|( pat, _)|format!("(^{})", pat)).collect::<Vec<_>>().join("|")).unwrap();
+            static ref R : regex::Regex = regex::Regex::new(&TOKENS.iter().map(|( pat, _)|format!("(^{})", pat)).collect::<Vec<_>>().join("|")).unwrap();
         }
 
-        if let Some(captures) = r.captures(&self.input[self.cursor..]) {
-            for (i, (_, conv)) in tokens.iter().enumerate() {
+        if let Some(captures) = R.captures(&self.input[self.cursor..]) {
+            for (i, (_, conv)) in TOKENS.iter().enumerate() {
                 if let Some(m) = captures.get(i+1) {
                     self.cursor += m.end();
                     if let Ok(tkn) = conv(m.as_str()) {
@@ -67,12 +67,18 @@ impl<'a> Iterator for Lexer<'a> {
 
 // The parser
 trait ExprVisitor {
-    type T;
-    fn num (&self, i: i64) -> Self::T;
-    fn mul (&self, l: Self::T, r: Self::T) -> Self::T;
-    fn div (&self, l: Self::T, r: Self::T) -> Self::T;
-    fn add (&self, l: Self::T, r: Self::T) -> Self::T;
-    fn sub (&self, l: Self::T, r: Self::T) -> Self::T;
+    type Expr;
+    type Term;
+    type Factor;
+    
+    /* expr ::= expr + term   */ fn add (&self, l: Self::Expr, r: Self::Term) -> Self::Expr;
+    /*      |   expr - term   */ fn sub (&self, l: Self::Expr, r: Self::Term) -> Self::Expr;
+    /*      |   term          */ fn term_expr (&self, t: Self::Term) -> Self::Expr;
+    /* term ::= term * factor */ fn mul (&self, l: Self::Term, r: Self::Factor) -> Self::Term;
+    /*      |   term / factor */ fn div (&self, l: Self::Term, r: Self::Factor) -> Self::Term;
+    /*      |   factor        */ fn factor_term (&self, f: Self::Factor) -> Self::Term;
+    /* factor ::= ( expr )    */ fn paren (&self, e: Self::Expr) -> Self::Factor;
+    /*        |   NUM         */ fn num (&self, i: i64) -> Self::Factor;
 }
 
 fn expect<'a, T:PartialEq>(next: &T, domain: &[T], err: &'a str) -> Result<(), &'a str> {
@@ -83,13 +89,13 @@ fn expect<'a, T:PartialEq>(next: &T, domain: &[T], err: &'a str) -> Result<(), &
     }
 }
 
-fn parseExpr<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<L>, visitor: &V) -> Result<<V as ExprVisitor>::T, &'a str> {
+fn parse_expr<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<L>, visitor: &V) -> Result<<V as ExprVisitor>::Expr, &'a str> {
     // expression ::= term { ('+'|'-') term }*"
-    let mut left = parseTerm(lexer, visitor)?;
+    let mut left = visitor.term_expr(parse_term(lexer, visitor)?);
     loop{
         if lexer.peek()==Some(&Token::Add) || lexer.peek()==Some(&Token::Sub) {
             let next = lexer.next().unwrap();
-            let right = parseTerm(lexer, visitor)?;
+            let right = parse_term(lexer, visitor)?;
             if next == Token::Add {
                 left = visitor.add(left, right);
             } else {
@@ -102,14 +108,14 @@ fn parseExpr<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<L>
     Ok(left)
 }
 
-fn parseTerm<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<L>, visitor: &V) -> Result<<V as ExprVisitor>::T, &'a str> {
+fn parse_term<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<L>, visitor: &V) -> Result<<V as ExprVisitor>::Term, &'a str> {
     // term ::= factor { ('*'|'/') factor }*
-    let mut left = parseFactor(lexer, visitor)?;
+    let mut left = visitor.factor_term(parse_factor(lexer, visitor)?);
     
     loop {
         if lexer.peek()==Some(&Token::Mul) || lexer.peek()==Some(&Token::Div) {
             let next = lexer.next().unwrap();
-            let right = parseFactor(lexer, visitor)?;
+            let right = parse_factor(lexer, visitor)?;
             if next == Token::Mul {
                 left = visitor.mul(left, right);
             } else {
@@ -122,13 +128,13 @@ fn parseTerm<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<L>
     Ok(left)
 }
 
-fn parseFactor<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<L>, visitor: &V) -> Result<<V as ExprVisitor>::T, &'a str> {
+fn parse_factor<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<L>, visitor: &V) -> Result<<V as ExprVisitor>::Factor, &'a str> {
     // factor ::= NUM | ( expr )
     let next = lexer.next();
     match next {
         Some(Token::Num(i)) => Ok(visitor.num(i)),
         Some(Token::LParen) => {
-            let e = parseExpr(lexer, visitor)?;
+            let e = visitor.paren(parse_expr(lexer, visitor)?);
             expect(&lexer.next(), &[Some(Token::RParen)], ")")?;
             Ok(e)
         },
@@ -140,7 +146,9 @@ fn parseFactor<'a, V:ExprVisitor, L:Iterator<Item=Token>> (lexer: &mut Peekable<
 //Visitor 1: Evaluator
 struct Evaluator;
 impl ExprVisitor for Evaluator {
-    type T = i64;
+    type Expr = i64;
+    type Term = i64;
+    type Factor = i64;
     fn num (&self, i: i64) -> i64 { 
         i 
     }
@@ -156,34 +164,76 @@ impl ExprVisitor for Evaluator {
     fn sub (&self, l: i64, r: i64) -> i64 {
         l - r
     }
+    fn paren (&self, i: i64) -> i64 { i }
+    fn factor_term (&self, i: i64) -> i64 { i }
+    fn term_expr (&self, i: i64) -> i64 { i }
 
 }
 
-//Visitor 2: Grammar tree builder
+//Visitor 2: Parse tree builder
 #[derive(Debug)]
-enum Expr {
-    Add(Box<Expr>, Box<Term>),
-    Sub(Box<Expr>, Box<Term>),
-    Term(Box<Term>)
+enum ExprNode {
+    Add(Box<ExprNode>, Box<TermNode>),
+    Sub(Box<ExprNode>, Box<TermNode>),
+    Term(Box<TermNode>)
 }
 
 #[derive(Debug)]
-enum Term {
-    Mul(Box<Term>, Box<Factor>),
-    Div(Box<Term>, Box<Factor>),
-    Factor(Box<Factor>)
+enum TermNode {
+    Mul(Box<TermNode>, Box<FactorNode>),
+    Div(Box<TermNode>, Box<FactorNode>),
+    Factor(Box<FactorNode>)
 }
 
 #[derive(Debug)]
-enum Factor {
-    Paren(Box<Expr>),
+enum FactorNode {
+    Paren(Box<ExprNode>),
     Num(i64)
 }
 
+struct SyntaxTreeBuilder {}
+
+impl ExprVisitor for SyntaxTreeBuilder {
+    type Expr = Box<ExprNode>;
+    type Term = Box<TermNode>;
+    type Factor = Box<FactorNode>;
+
+    fn add (&self, l: Box<ExprNode>, r: Box<TermNode>) -> Box<ExprNode> {
+        Box::new(ExprNode::Add(l, r))
+    }
+    fn sub (&self, l: Box<ExprNode>, r: Box<TermNode>) -> Box<ExprNode> {
+        Box::new(ExprNode::Sub(l, r))
+    }
+    fn term_expr (&self, t: Box<TermNode>) -> Box<ExprNode> {
+        Box::new(ExprNode::Term(t))
+    }
+    fn mul (&self, l: Box<TermNode>, r: Box<FactorNode>) -> Box<TermNode> {
+        Box::new(TermNode::Mul(l, r))
+    }
+    fn div (&self, l: Box<TermNode>, r: Box<FactorNode>) -> Box<TermNode> {
+        Box::new(TermNode::Div(l, r))
+    }
+    fn factor_term (&self, f: Box<FactorNode>) -> Box<TermNode> {
+        Box::new(TermNode::Factor(f))
+    }
+    fn paren (&self, e: Box<ExprNode>) -> Box<FactorNode> {
+        Box::new(FactorNode::Paren(e))
+    }
+    fn num (&self, i: i64) -> Box<FactorNode> {
+        Box::new(FactorNode::Num(i))
+    }
+}
+
+fn parse<'a, V: ExprVisitor> (s: &str, visitor: &V) -> Result<<V as ExprVisitor>::Expr, &'a str> {
+    parse_expr(&mut Lexer::new(s).filter(|t|*t!=Token::Ws).peekable(), visitor)
+}
 
 fn main() {
     let e1 = "2+3*(1-2)";
-    let r1 = parseExpr(&mut Lexer::new(e1).filter(|t|*t!=Token::Ws).peekable(), &Evaluator{}).unwrap();
-    println!("{}={}", e1, r1)
+    let r1 = parse(e1, &Evaluator{}).unwrap();
+    println!("{}={}", e1, r1);
+        
+    let r2 = parse(e1, &SyntaxTreeBuilder{}).unwrap();
+    println!("{:?}", r2);
 
 }
